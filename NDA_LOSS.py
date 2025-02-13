@@ -46,11 +46,16 @@ class NDALoss(nn.Module):
         self.spectrogram = Spectrogram(n_fft=n_fft, hop_length=hop_length, power=1)
         self.mel_scale = MelScale(n_mels=n_mels, sample_rate=sample_rate, n_stft=n_fft // 2 + 1)
 
+    def to(self, device):
+        super().to(device)
+        self.spectrogram = self.spectrogram.to(device)
+        self.mel_scale = self.mel_scale.to(device)
+        return self
+
     def compute_mel_spectrum(self, waveform):
         spectrogram = self.spectrogram(waveform)  # Compute spectrogram
         mel_spectrum = self.mel_scale(spectrogram)  # Convert to MEL-scale
         return torch.pow(mel_spectrum, 1/3)  # Apply cube root compression
-
     def compute_differential_spectrum(self, mel_spectrum):
         alpha = torch.tensor([0.25, 0.5, 0.75, 1.0], device=mel_spectrum.device)
         velocity_diff = torch.zeros_like(mel_spectrum)
@@ -94,10 +99,10 @@ class NDALoss(nn.Module):
         B_vel_c, B_acc_c = self.compute_differential_spectrum(B_c)
         B_vel_s, B_acc_s = self.compute_differential_spectrum(B_s)
 
-        energy = torch.mean(torch.abs(cleanwav), dim=1, keepdim=True)
-        V = (energy > 0.01 * torch.max(energy)).float()
-        V = V.unsqueeze(1).expand_as(B_c)
-        V_s = 1 - V
+        # Compute V based on the energy of the clean mel-spectrogram
+        energy = torch.mean(torch.abs(B_s), dim=1, keepdim=True)  # Shape: [batch_size, 1, time_frames]
+        V = (energy > 0.01 * torch.max(energy)).float()  # Shape: [batch_size, 1, time_frames]
+        V_s = 1 - V  # Shape: [batch_size, 1, time_frames]
 
         L_env = self.envelope_loss(B_c, B_s, V)
         L_sp = self.continuity_loss_speech(B_vel_c, B_vel_s, B_acc_c, B_acc_s, V)
@@ -107,7 +112,6 @@ class NDALoss(nn.Module):
         denoising_loss = SISNR_Loss(enhancedwav, cleanwav)
 
         L_NDA = denoising_loss + self.gamma * L_env + self.mu * L_sp + self.omega * L_sil
-        # L_NDA = L_NDA.item()
         return L_NDA
 
 
