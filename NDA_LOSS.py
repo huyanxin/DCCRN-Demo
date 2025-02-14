@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchaudio.transforms import Spectrogram, MelScale
+import numpy as np
 
 class SISNRLoss(nn.Module):
     def __init__(self):
@@ -28,6 +29,8 @@ class SISNRLoss(nn.Module):
         si_snr = 10 * torch.log10(s_target_energy / (e_noise_energy + 1e-8))
 
         return -torch.mean(si_snr)
+
+from utils.v_activlev import v_activlev
 
 class NDALoss(nn.Module):
     def __init__(self, sample_rate=16000, n_fft=512, hop_length=256, n_mels=80, gamma=5, mu=20, omega=20, eta=3, tau=2):
@@ -73,17 +76,51 @@ class NDALoss(nn.Module):
         return velocity_diff, acceleration_diff
 
     def envelope_loss(self, B_c, B_s, V):
+        """
+        Envelope Loss Function
+        :param B_c: Enhanced speech MEL spectrum (cube root compressed) [batch, n_mels, time_frames]
+        :param B_s: Clean speech MEL spectrum (cube root compressed) [batch, n_mels, time_frames]
+        :param V: Voice Activity Detection (VAD) information [batch, 1, time_samples]
+        :return: Envelope loss
+        """
+        # Downsample V to match the time frames of B_c and B_s
+        time_frames = B_c.size(2)  # Number of time frames in B_c and B_s
+        V_downsampled = F.avg_pool1d(V, kernel_size=V.size(2) // time_frames, stride=V.size(2) // time_frames)
+        V_downsampled = V_downsampled.squeeze(1)  # Remove the channel dimension
+
+        # Expand V_downsampled to match the shape of B_c and B_s
+        V_downsampled = V_downsampled.unsqueeze(1).expand_as(B_c)  # [batch, n_mels, time_frames]
+
+        # Compute the asymmetric difference
         diff = B_c - B_s
         asym_diff = torch.where(diff > 0, diff, self.eta * diff)
-        loss = torch.mean(torch.abs(asym_diff * V))
+
+        # Compute the loss
+        loss = torch.mean(torch.abs(asym_diff * V_downsampled))
+
         return loss
 
     def continuity_loss_speech(self, B_vel_c, B_vel_s, B_acc_c, B_acc_s, V):
+        # Downsample V to match the time frames of B_c and B_s
+        time_frames = B_vel_c.size(2)  # Number of time frames in B_c and B_s
+        V_downsampled = F.avg_pool1d(V, kernel_size=V.size(2) // time_frames, stride=V.size(2) // time_frames)
+        V_downsampled = V_downsampled.squeeze(1)  # Remove the channel dimension
+
+        # Expand V_downsampled to match the shape of B_c and B_s
+        V = V_downsampled.unsqueeze(1).expand_as(B_vel_c)  # [batch, n_mels, time_frames]
         loss_vel = torch.mean(torch.abs(B_vel_c - B_vel_s) * V)
         loss_acc = torch.mean(torch.abs(B_acc_c - B_acc_s) * V)
         return loss_vel + loss_acc
 
     def continuity_loss_non_speech(self, B_c, V_s):
+        # Downsample V to match the time frames of B_c and B_s
+        time_frames = B_c.size(2)  # Number of time frames in B_c and B_s
+        V_downsampled = F.avg_pool1d(V_s, kernel_size=V_s.size(2) // time_frames, stride=V_s.size(2) // time_frames)
+        V_downsampled = V_downsampled.squeeze(1)  # Remove the channel dimension
+
+        # Expand V_downsampled to match the shape of B_c and B_s
+        V_s = V_downsampled.unsqueeze(1).expand_as(B_c)  # [batch, n_mels, time_frames]
+
         loss = 0
         for tau in range(-self.tau, self.tau + 1):
             if tau == 0:
@@ -99,9 +136,20 @@ class NDALoss(nn.Module):
         B_vel_c, B_acc_c = self.compute_differential_spectrum(B_c)
         B_vel_s, B_acc_s = self.compute_differential_spectrum(B_s)
 
-        # Compute V based on the energy of the clean mel-spectrogram
-        energy = torch.mean(torch.abs(B_s), dim=1, keepdim=True)  # Shape: [batch_size, 1, time_frames]
-        V = (energy > 0.01 * torch.max(energy)).float()  # Shape: [batch_size, 1, time_frames]
+        # 处理每个批次的VAD
+        batch_size = cleanwav.shape[0]
+        V = []
+        for i in range(batch_size):
+            # 获取单个音频并转换为numpy数组
+            clean_np = cleanwav[i].numpy()
+            clean_np = np.array(clean_np,dtype=np.float32)
+            _, _, _, vad = v_activlev(sp=clean_np.copy(), fs=16000, mode='0')  # 使用copy()创建数组副本
+            V.append(vad)
+        # 将VAD列表转换为tensor并调整维度
+        V = np.array(V, dtype=np.float32)
+        V = torch.tensor(V, dtype=torch.float32, device=cleanwav.device) # [batch_size, time]
+        V = V.unsqueeze(1)  # [batch_size, 1, time]
+
         V_s = 1 - V  # Shape: [batch_size, 1, time_frames]
 
         L_env = self.envelope_loss(B_c, B_s, V)
@@ -118,8 +166,8 @@ class NDALoss(nn.Module):
 if __name__ == "__main__":
     loss_fn = NDALoss(sample_rate=16000, n_fft=512, hop_length=256, n_mels=80, gamma=5, mu=20, omega=20, eta=3, tau=2)
 
-    enhancedwav = torch.randn(1, 32000)
-    cleanwav = torch.randn(1, 32000)
+    enhancedwav = torch.randn(2, 32000)
+    cleanwav = torch.randn(2, 32000)
 
     loss = loss_fn(enhancedwav, cleanwav)
     print("Loss: ", loss.item())
